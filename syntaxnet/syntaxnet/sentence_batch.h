@@ -18,6 +18,7 @@ limitations under the License.
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "syntaxnet/embedding_feature_extractor.h"
@@ -25,9 +26,7 @@ limitations under the License.
 #include "syntaxnet/parser_state.h"
 #include "syntaxnet/parser_transitions.h"
 #include "syntaxnet/sentence.pb.h"
-#include "syntaxnet/sparse.pb.h"
 #include "syntaxnet/task_context.h"
-#include "syntaxnet/task_spec.pb.h"
 #include "syntaxnet/term_frequency_map.h"
 
 namespace syntaxnet {
@@ -38,7 +37,7 @@ class SentenceBatch {
  public:
   SentenceBatch(int batch_size, string input_name)
       : batch_size_(batch_size),
-        input_name_(input_name),
+        input_name_(std::move(input_name)),
         sentences_(batch_size) {}
 
   // Initializes all resources and opens the corpus file.

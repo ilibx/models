@@ -14,19 +14,38 @@ limitations under the License.
 ==============================================================================*/
 
 #include <memory>
-#include <string>
-#include <vector>
 
+#include "syntaxnet/base.h"
 #include "syntaxnet/document_format.h"
-#include "syntaxnet/sentence.pb.h"
 #include "syntaxnet/segmenter_utils.h"
+#include "syntaxnet/sentence.pb.h"
 #include "syntaxnet/utils.h"
-#include "tensorflow/core/lib/io/inputbuffer.h"
+#include "tensorflow/core/lib/io/buffered_inputstream.h"
 #include "tensorflow/core/lib/strings/strcat.h"
 #include "tensorflow/core/lib/strings/stringprintf.h"
 #include "tensorflow/core/platform/regexp.h"
 
 namespace syntaxnet {
+
+namespace {
+
+// Reads up to the first empty line, and returns false end of file is reached.
+//
+// This reader is shared by CONLL and prototext formats, where records are
+// separated by double newlines.
+bool DoubleNewlineReadRecord(tensorflow::io::BufferedInputStream *buffer,
+                             string *record) {
+  string line;
+  record->clear();
+  tensorflow::Status status = buffer->ReadLine(&line);
+  while (!line.empty() && status.ok()) {
+    tensorflow::strings::StrAppend(record, line, "\n");
+    status = buffer->ReadLine(&line);
+  }
+  return status.ok() || !record->empty();
+}
+
+}  // namespace
 
 // CoNLL document format reader for dependency annotated corpora.
 // The expected format is described e.g. at http://ilk.uvt.nl/conll/#dataformat
@@ -56,10 +75,12 @@ namespace syntaxnet {
 //
 // This CoNLL reader is compatible with the CoNLL-U format described at
 //   http://universaldependencies.org/format.html
-// Note that this reader skips CoNLL-U multiword tokens and ignores the last two
-// fields of every line, which are PHEAD and PDEPREL in CoNLL format, but are
-// replaced by DEPS and MISC in CoNLL-U.
+// Note that this reader skips CoNLL-U multiword tokens and empty nodes.
 //
+// Note on reconstruct the raw text of a sentence: the raw text is constructed
+// by concatenating all words (field 2) with a intervening space between
+// consecutive words.  If the last field of a token is "SpaceAfter=No", there
+// would be no space between current word and the next one.
 class CoNLLSyntaxFormat : public DocumentFormat {
  public:
   CoNLLSyntaxFormat() {}
@@ -67,32 +88,28 @@ class CoNLLSyntaxFormat : public DocumentFormat {
   void Setup(TaskContext *context) override {
     join_category_to_pos_ = context->GetBoolParameter("join_category_to_pos");
     add_pos_as_attribute_ = context->GetBoolParameter("add_pos_as_attribute");
+    serialize_morph_to_pos_ =
+        context->GetBoolParameter("serialize_morph_to_pos");
   }
 
   // Reads up to the first empty line and returns false end of file is reached.
-  bool ReadRecord(tensorflow::io::InputBuffer *buffer,
+  bool ReadRecord(tensorflow::io::BufferedInputStream *buffer,
                   string *record) override {
-    string line;
-    record->clear();
-    tensorflow::Status status = buffer->ReadLine(&line);
-    while (!line.empty() && status.ok()) {
-      tensorflow::strings::StrAppend(record, line, "\n");
-      status = buffer->ReadLine(&line);
-    }
-    return status.ok() || !record->empty();
+    return DoubleNewlineReadRecord(buffer, record);
   }
 
   void ConvertFromString(const string &key, const string &value,
-                         vector<Sentence *> *sentences) override {
+                         std::vector<Sentence *> *sentences) override {
     // Create new sentence.
     Sentence *sentence = new Sentence();
 
     // Each line corresponds to one token.
     string text;
-    vector<string> lines = utils::Split(value, '\n');
+    bool add_space_to_text = true;
+    std::vector<string> lines = utils::Split(value, '\n');
 
     // Add each token to the sentence.
-    vector<string> fields;
+    std::vector<string> fields;
     int expected_id = 1;
     for (size_t i = 0; i < lines.size(); ++i) {
       // Split line into tab-separated fields.
@@ -107,6 +124,10 @@ class CoNLLSyntaxFormat : public DocumentFormat {
       // hyphenated line numbers, e.g., "2-4".
       // http://universaldependencies.github.io/docs/format.html
       if (RE2::FullMatch(fields[0], "[0-9]+-[0-9]+")) continue;
+
+      // Skip CoNLLU lines for empty tokens, indicated by decimals.
+      // Introduced in v2. http://universaldependencies.org/format.html
+      if (RE2::FullMatch(fields[0], "[0-9]+\\.[0-9]+")) continue;
 
       // Clear all optional fields equal to '_'.
       for (size_t j = 2; j < fields.size(); ++j) {
@@ -132,10 +153,11 @@ class CoNLLSyntaxFormat : public DocumentFormat {
       const string &label = fields[7];
 
       // Add token to sentence text.
-      if (!text.empty()) text.append(" ");
+      if (!text.empty() && add_space_to_text) text.append(" ");
       const int start = text.size();
       const int end = start + word.size() - 1;
       text.append(word);
+      add_space_to_text = fields[9] != "SpaceAfter=No";
 
       // Add token to sentence.
       Token *token = sentence->add_token();
@@ -149,6 +171,7 @@ class CoNLLSyntaxFormat : public DocumentFormat {
       if (!attributes.empty()) AddMorphAttributes(attributes, token);
       if (join_category_to_pos_) JoinCategoryToPos(token);
       if (add_pos_as_attribute_) AddPosAsAttribute(token);
+      if (serialize_morph_to_pos_) SerializeMorphToPos(token);
     }
 
     if (sentence->token_size() > 0) {
@@ -166,12 +189,12 @@ class CoNLLSyntaxFormat : public DocumentFormat {
   void ConvertToString(const Sentence &sentence, string *key,
                        string *value) override {
     *key = sentence.docid();
-    vector<string> lines;
+    std::vector<string> lines;
     for (int i = 0; i < sentence.token_size(); ++i) {
       Token token = sentence.token(i);
       if (join_category_to_pos_) SplitCategoryFromPos(&token);
       if (add_pos_as_attribute_) RemovePosFromAttributes(&token);
-      vector<string> fields(10);
+      std::vector<string> fields(10);
       fields[0] = tensorflow::strings::Printf("%d", i + 1);
       fields[1] = UnderscoreIfEmpty(token.word());
       fields[2] = "_";
@@ -198,14 +221,14 @@ class CoNLLSyntaxFormat : public DocumentFormat {
   void AddMorphAttributes(const string &attributes, Token *token) {
     TokenMorphology *morph =
         token->MutableExtension(TokenMorphology::morphology);
-    vector<string> att_vals = utils::Split(attributes, '|');
+    std::vector<string> att_vals = utils::Split(attributes, '|');
     for (int i = 0; i < att_vals.size(); ++i) {
-      vector<string> att_val = utils::SplitOne(att_vals[i], '=');
+      std::vector<string> att_val = utils::SplitOne(att_vals[i], '=');
 
       // Format is either:
       //   1) a1=v1|a2=v2..., e.g., Czech CoNLL data, or,
       //   2) v1|v2|..., e.g., German CoNLL data.
-      const pair<string, string> name_value =
+      const std::pair<string, string> name_value =
           att_val.size() == 2 ? std::make_pair(att_val[0], att_val[1])
                               : std::make_pair(att_val[0], "on");
 
@@ -276,13 +299,141 @@ class CoNLLSyntaxFormat : public DocumentFormat {
     }
   }
 
+  void SerializeMorphToPos(Token *token) {
+    const TokenMorphology &morph =
+        token->GetExtension(TokenMorphology::morphology);
+    TextFormat::Printer printer;
+    printer.SetSingleLineMode(true);
+    string morph_str;
+    printer.PrintToString(morph, &morph_str);
+    token->set_tag(morph_str);
+  }
+
   bool join_category_to_pos_ = false;
   bool add_pos_as_attribute_ = false;
+  bool serialize_morph_to_pos_ = false;
 
   TF_DISALLOW_COPY_AND_ASSIGN(CoNLLSyntaxFormat);
 };
 
-REGISTER_DOCUMENT_FORMAT("conll-sentence", CoNLLSyntaxFormat);
+REGISTER_SYNTAXNET_DOCUMENT_FORMAT("conll-sentence", CoNLLSyntaxFormat);
+
+// Reader for segmentation training data format. This reader assumes the input
+// format is similar to CoNLL format but with only two fileds:
+//
+// Fields:
+// 1  FORM:        Word form or punctuation symbol.
+// 2  SPACE FLAG:  Can be either 'SPACE' or 'NO_SPACE' indicates that whether
+//                 there should be a space between this word and the next one in
+//                 the raw text.
+//
+// Examples:
+// To create a training example for sentence with raw text:
+//   That's a good point.
+// and the corresponding gold segmentation:
+//   That 's a good point .
+// Then the correct input is:
+// That	NO_SPACE
+// 's	SPACE
+// a	SPACE
+// good	SPACE
+// point	NO_SPACE
+// .	NO_SPACE
+//
+// Yet another example:
+// To create a training example for sentence with raw text:
+//   这是一个测试
+// and the corresponding gold segmentation:
+//   这 是 一 个 测试
+// Then the correct input is:
+// 这	NO_SPACE
+// 是	NO_SPACE
+// 一	NO_SPACE
+// 个	NO_SPACE
+// 测试	NO_SPACE
+class SegmentationTrainingDataFormat : public CoNLLSyntaxFormat {
+ public:
+  // Converts to segmentation training data by breaking those word in the input
+  // tokens to utf8 character based tokens. Moreover, if a character is the
+  // first char of the word in the original token, then its break level is set
+  // to SPACE_BREAK to indicate that the corresponding gold transition for that
+  // character token is START. Otherwise NO_BREAK to indicate MERGE.
+  void ConvertFromString(const string &key, const string &value,
+                         std::vector<Sentence *> *sentences) override {
+    // Create new sentence.
+    Sentence *sentence = new Sentence();
+
+    // Each line corresponds to one token.
+    string text;
+    std::vector<string> lines = utils::Split(value, '\n');
+
+    // Add each token to the sentence.
+    std::vector<string> fields;
+    for (size_t i = 0; i < lines.size(); ++i) {
+      // Split line into tab-separated fields.
+      fields.clear();
+      fields = utils::Split(lines[i], '\t');
+      if (fields.empty()) continue;
+
+      // Skip comment lines.
+      if (fields[0][0] == '#') continue;
+
+      // Check that the line is valid.
+      CHECK_GE(fields.size(), 2)
+          << "Every line has to have at least 8 tab separated fields.";
+
+      // Get relevant fields.
+      const string &word = fields[0];
+      CHECK(fields[1] == "SPACE" || fields[1] == "NO_SPACE")
+          << "The space field can only be either 'SPACE' or 'NO_SPACE'";
+      const bool space_after = fields[1] == "SPACE";
+
+      // Add token to sentence text.
+      int start = text.size();
+      text.append(word);
+      if (space_after && i != lines.size() - 1) {
+        text.append(" ");
+      }
+
+      // Add character-based token to sentence.
+      std::vector<tensorflow::StringPiece> chars;
+      SegmenterUtils::GetUTF8Chars(word, &chars);
+      bool is_first_char = true;
+      for (auto utf8char : chars) {
+        Token *char_token = sentence->add_token();
+        char_token->set_word(utf8char.ToString());
+        char_token->set_start(start);
+        start += char_token->word().size();
+        char_token->set_end(start - 1);
+        char_token->set_break_level(
+            is_first_char ? Token::SPACE_BREAK : Token::NO_BREAK);
+        is_first_char = false;
+      }
+
+      // Add another space token.
+      if (space_after) {
+        Token *char_token = sentence->add_token();
+        char_token->set_word(" ");
+        char_token->set_start(start);
+        char_token->set_end(start);
+        char_token->set_break_level(Token::SPACE_BREAK);
+      }
+    }
+
+    if (sentence->token_size() > 0) {
+      sentence->set_docid(key);
+      sentence->set_text(text);
+      sentences->push_back(sentence);
+    } else {
+      // If the sentence was empty (e.g., blank lines at the beginning of a
+      // file), then don't save it.
+      delete sentence;
+    }
+  }
+};
+
+REGISTER_SYNTAXNET_DOCUMENT_FORMAT("segment-train-data",
+                                   SegmentationTrainingDataFormat);
 
 // Reader for tokenized text. This reader expects every sentence to be on a
 // single line and tokens on that line to be separated by single spaces.
@@ -292,13 +443,13 @@ class TokenizedTextFormat : public DocumentFormat {
   TokenizedTextFormat() {}
 
   // Reads a line and returns false if end of file is reached.
-  bool ReadRecord(tensorflow::io::InputBuffer *buffer,
+  bool ReadRecord(tensorflow::io::BufferedInputStream *buffer,
                   string *record) override {
     return buffer->ReadLine(record).ok();
   }
 
   void ConvertFromString(const string &key, const string &value,
-                         vector<Sentence *> *sentences) override {
+                         std::vector<Sentence *> *sentences) override {
     Sentence *sentence = new Sentence();
     string text;
     for (const string &word : utils::Split(value, ' ')) {
@@ -347,7 +498,7 @@ class TokenizedTextFormat : public DocumentFormat {
   TF_DISALLOW_COPY_AND_ASSIGN(TokenizedTextFormat);
 };
 
-REGISTER_DOCUMENT_FORMAT("tokenized-text", TokenizedTextFormat);
+REGISTER_SYNTAXNET_DOCUMENT_FORMAT("tokenized-text", TokenizedTextFormat);
 
 // Reader for un-tokenized text. This reader expects every sentence to be on a
 // single line. For each line in the input, a sentence proto will be created,
@@ -358,9 +509,9 @@ class UntokenizedTextFormat : public TokenizedTextFormat {
   UntokenizedTextFormat() {}
 
   void ConvertFromString(const string &key, const string &value,
-                         vector<Sentence *> *sentences) override {
+                         std::vector<Sentence *> *sentences) override {
     Sentence *sentence = new Sentence();
-    vector<tensorflow::StringPiece> chars;
+    std::vector<tensorflow::StringPiece> chars;
     SegmenterUtils::GetUTF8Chars(value, &chars);
     int start = 0;
     for (auto utf8char : chars) {
@@ -386,7 +537,7 @@ class UntokenizedTextFormat : public TokenizedTextFormat {
   TF_DISALLOW_COPY_AND_ASSIGN(UntokenizedTextFormat);
 };
 
-REGISTER_DOCUMENT_FORMAT("untokenized-text", UntokenizedTextFormat);
+REGISTER_SYNTAXNET_DOCUMENT_FORMAT("untokenized-text", UntokenizedTextFormat);
 
 // Text reader that attmpts to perform Penn Treebank tokenization on arbitrary
 // raw text. Adapted from https://www.cis.upenn.edu/~treebank/tokenizer.sed
@@ -398,8 +549,8 @@ class EnglishTextFormat : public TokenizedTextFormat {
   EnglishTextFormat() {}
 
   void ConvertFromString(const string &key, const string &value,
-                         vector<Sentence *> *sentences) override {
-    vector<pair<string, string>> preproc_rules = {
+                         std::vector<Sentence *> *sentences) override {
+    std::vector<std::pair<string, string>> preproc_rules = {
         // Punctuation.
         {"’", "'"},
         {"…", "..."},
@@ -454,7 +605,7 @@ class EnglishTextFormat : public TokenizedTextFormat {
         {"♦", ""},
     };
 
-    vector<pair<string, string>> rules = {
+    std::vector<std::pair<string, string>> rules = {
         // attempt to get correct directional quotes
         {R"re(^")re", "`` "},
         {R"re(([ \([{<])")re", "\\1 `` "},
@@ -523,10 +674,10 @@ class EnglishTextFormat : public TokenizedTextFormat {
     };
 
     string rewritten = value;
-    for (const pair<string, string> &rule : preproc_rules) {
+    for (const std::pair<string, string> &rule : preproc_rules) {
       RE2::GlobalReplace(&rewritten, rule.first, rule.second);
     }
-    for (const pair<string, string> &rule : rules) {
+    for (const std::pair<string, string> &rule : rules) {
       RE2::GlobalReplace(&rewritten, rule.first, rule.second);
     }
     TokenizedTextFormat::ConvertFromString(key, rewritten, sentences);
@@ -536,6 +687,37 @@ class EnglishTextFormat : public TokenizedTextFormat {
   TF_DISALLOW_COPY_AND_ASSIGN(EnglishTextFormat);
 };
 
-REGISTER_DOCUMENT_FORMAT("english-text", EnglishTextFormat);
+REGISTER_SYNTAXNET_DOCUMENT_FORMAT("english-text", EnglishTextFormat);
+
+// Converts double-newline-separated prototext records into sentences.
+class SentencePrototextFormat : public DocumentFormat {
+ public:
+  SentencePrototextFormat() {}
+
+  bool ReadRecord(tensorflow::io::BufferedInputStream *buffer,
+                  string *record) override {
+    return DoubleNewlineReadRecord(buffer, record);
+  }
+
+  void ConvertFromString(const string &key, const string &value,
+                         std::vector<Sentence *> *sentences) override {
+    Sentence *sentence = new Sentence();
+    CHECK(TextFormat::ParseFromString(value, sentence))
+        << "Failed to parse " << value;
+    sentences->push_back(sentence);
+  }
+
+  void ConvertToString(const Sentence &sentence, string *key,
+                       string *value) override {
+    *key = sentence.docid();
+    string as_prototext;
+    CHECK(TextFormat::PrintToString(sentence, &as_prototext))
+        << "Failed to sentence with ID " << (*key);
+    *value = tensorflow::strings::StrCat(as_prototext, "\n\n");
+  }
+};
+
+REGISTER_SYNTAXNET_DOCUMENT_FORMAT("sentence-prototext",
+                                   SentencePrototextFormat);
 
 }  // namespace syntaxnet
